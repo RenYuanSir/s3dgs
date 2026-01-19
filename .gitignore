@@ -1,0 +1,88 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data
+data/
+video_data/
+*.mp4
+*.avi
+*.mov
+
+# Output
+output/
+results/
+renders/
+ckpts/
+*.pt
+*.ckpt
+
+# Logs
+*.log
+debug/
+logs/
+
+# COLMAP
+*.bin
+*.ply
+sparse/
+
+# Heatmaps (large binary files)
+*.npy
+# Uncomment if you want to exclude all .npy files
+
+# But keep a small sample for testing
+# !heatmaps/sample_*.npy
+
+# Virtual Environment
+venv/
+env/
+ENV/
+mygsplat/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Test files
+test/
+tests/
+*.test.py
+
+# Experimental
+*_old.py
+*_backup.py
+*_deprecated.py
+
+# Documentation drafts (keep only final docs)
+draft_*.md
+TODO*.md
+
+# Large model files
+*.pth
+*.safetensors
+
+# Cache
+.cache/
