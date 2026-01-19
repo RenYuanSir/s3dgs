@@ -40,6 +40,10 @@ python preprocess/generate_depth.py \
 - Uses `gradio_client` with `handle_file()` wrapper
 - Endpoint: `depth-anything/Depth-Anything-V2`
 - API name: `/on_submit`
+- Returns tuple of 3 elements:
+  - `[0]` `Tuple[filepath, filepath]` - ImageSlider component (before/after comparison)
+  - `[1]` `filepath` - Grayscale depth map (8-bit PNG) ← **We use this**
+  - `[2]` `filepath` - 16-bit raw output (can be considered as disparity)
 - Example call:
   ```python
   from gradio_client import Client, handle_file
@@ -49,6 +53,8 @@ python preprocess/generate_depth.py \
       image=handle_file('path/to/image.jpg'),
       api_name="/on_submit"
   )
+  # result is a tuple: (imageslider_tuple, depth_grayscale_path, depth_16bit_path)
+  depth_file = result[1]  # Use the grayscale depth map
   ```
 
 **Output**:
@@ -210,8 +216,11 @@ Client ready!
 
 Testing API connection...
 ✓ API connection successful!
-  Result type: <class 'str'>
-  Result path: /tmp/gradio/...
+  Result type: <class 'tuple'>
+  Tuple length: 3
+  [0] ImageSlider: <class 'tuple'>
+  [1] Grayscale depth: /tmp/gradio/...
+  [2] 16-bit depth: /tmp/gradio/...
 
 Generating depth maps: 100%|████████████| 500/500 [10:25<00:00,  1.25s/it]
 Processing complete!

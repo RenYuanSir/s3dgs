@@ -64,6 +64,14 @@ def generate_depth_for_image(client, image_path: str) -> np.ndarray:
             image=handle_file('path/to/image.jpg'),
             api_name="/on_submit"
         )
+
+    Returns:
+        Tuple of 3 elements:
+        [0] Tuple[filepath | None, filepath | None] | None - ImageSlider component (before/after)
+        [1] filepath - Grayscale depth map (8-bit PNG)
+        [2] filepath - 16-bit raw output (can be considered as disparity)
+
+    We use element [1] for the grayscale depth map.
     """
     try:
         from gradio_client import handle_file
@@ -75,20 +83,30 @@ def generate_depth_for_image(client, image_path: str) -> np.ndarray:
             api_name="/on_submit"
         )
 
-        # The result is typically a file path to the output depth image
-        if isinstance(result, str):
-            # If it's a file path, load it
+        # Handle tuple return (3 elements)
+        if isinstance(result, tuple) and len(result) >= 2:
+            # result[1] is the grayscale depth map filepath
+            depth_file = result[1]
+
+            if depth_file is None or not isinstance(depth_file, str):
+                raise ValueError(f"Invalid depth file path: {depth_file}")
+
+            # Load the depth map
+            depth_image = Image.open(depth_file).convert('L')
+            depth_map = np.array(depth_image, dtype=np.float32) / 255.0
+
+        elif isinstance(result, str):
+            # Fallback: if single string returned
             depth_image = Image.open(result).convert('L')
             depth_map = np.array(depth_image, dtype=np.float32) / 255.0
+
         elif isinstance(result, np.ndarray):
             # If it's already a numpy array
             depth_map = result.astype(np.float32)
             if depth_map.max() > 1.0:
                 depth_map = depth_map / depth_map.max()  # Normalize to [0, 1]
         else:
-            # Fallback: try to convert to PIL Image
-            depth_image = Image.fromarray(result)
-            depth_map = np.array(depth_image, dtype=np.float32) / 255.0
+            raise ValueError(f"Unexpected result type: {type(result)}")
 
         return depth_map
 
@@ -109,8 +127,8 @@ def save_depth_map(depth_map: np.ndarray, output_path: str):
     # Convert to 16-bit integer range [0, 65535]
     depth_16bit = (depth_map * 65535).astype(np.uint16)
 
-    # Save as 16-bit PNG
-    Image.fromarray(depth_16bit, mode='I;16').save(output_path)
+    # Save as 16-bit PNG (without deprecated mode parameter)
+    Image.fromarray(depth_16bit).save(output_path)
 
 
 def load_depth_map(depth_path: str) -> np.ndarray:
@@ -154,8 +172,17 @@ def test_api_connection(client):
         if result is not None:
             print("✓ API connection successful!")
             print(f"  Result type: {type(result)}")
-            if isinstance(result, str):
+
+            # Handle tuple return
+            if isinstance(result, tuple):
+                print(f"  Tuple length: {len(result)}")
+                if len(result) >= 2:
+                    print(f"  [0] ImageSlider: {type(result[0])}")
+                    print(f"  [1] Grayscale depth: {result[1]}")
+                    print(f"  [2] 16-bit depth: {result[2] if len(result) > 2 else 'N/A'}")
+            elif isinstance(result, str):
                 print(f"  Result path: {result}")
+
             return True
         else:
             print("✗ API returned None")

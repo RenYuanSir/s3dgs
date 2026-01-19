@@ -31,7 +31,17 @@ def test_depth_api():
 
         print(f"   ✓ API call successful!")
         print(f"   Result type: {type(result)}")
-        print(f"   Result: {result}")
+
+        # Handle tuple return (3 elements)
+        if isinstance(result, tuple):
+            print(f"   Tuple length: {len(result)}")
+            print(f"   [0] ImageSlider: {type(result[0])}")
+            if len(result) >= 2:
+                print(f"   [1] Grayscale depth: {result[1]}")
+            if len(result) >= 3:
+                print(f"   [2] 16-bit depth: {result[2]}")
+        else:
+            print(f"   Result: {result}")
 
         return True
 
@@ -50,8 +60,6 @@ def test_local_image(image_path: str):
     print(f"   Image: {image_path}")
 
     try:
-        from gradio_client import Client, handle_file
-
         client = Client("depth-anything/Depth-Anything-V2")
         result = client.predict(
             image=handle_file(image_path),
@@ -59,18 +67,30 @@ def test_local_image(image_path: str):
         )
 
         print(f"   ✓ API call successful!")
-        print(f"   Result: {result}")
+        print(f"   Result type: {type(result)}")
 
-        # Try to load the result if it's a file path
-        from PIL import Image
-        import numpy as np
+        # Handle tuple return (3 elements)
+        if isinstance(result, tuple):
+            print(f"   Tuple length: {len(result)}")
+            if len(result) >= 2:
+                depth_file = result[1]
+                print(f"   [1] Grayscale depth: {depth_file}")
 
-        if isinstance(result, str) and os.path.exists(result):
-            depth_img = Image.open(result)
-            depth_map = np.array(depth_img)
-            print(f"   Depth map shape: {depth_map.shape}")
-            print(f"   Depth map dtype: {depth_map.dtype}")
-            print(f"   Depth range: [{depth_map.min()}, {depth_map.max()}]")
+                # Try to load the depth map
+                from PIL import Image
+                import numpy as np
+
+                if os.path.exists(depth_file):
+                    depth_img = Image.open(depth_file)
+                    depth_map = np.array(depth_img)
+                    print(f"   Depth map shape: {depth_map.shape}")
+                    print(f"   Depth map dtype: {depth_map.dtype}")
+                    print(f"   Depth range: [{depth_map.min()}, {depth_map.max()}]")
+
+            if len(result) >= 3:
+                print(f"   [2] 16-bit depth: {result[2]}")
+        else:
+            print(f"   Result: {result}")
 
         return True
 
