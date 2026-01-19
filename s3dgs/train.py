@@ -50,6 +50,84 @@ from s3dgs.dataset import TomatoDataset, create_dataloader
 # Loss Functions
 # ============================================================================
 
+def scale_invariant_depth_loss(
+    pred_depth: torch.Tensor,
+    gt_depth: torch.Tensor,
+    mask: torch.Tensor = None
+) -> torch.Tensor:
+    """
+    Scale-invariant depth loss for monocular depth priors.
+
+    Since monocular depth is relative (up to scale and shift), we solve for the
+    optimal scale (s) and shift (t) that align prediction with ground truth:
+        s * pred_depth + t ≈ gt_depth
+
+    Then compute L1 loss on the aligned depth.
+
+    Args:
+        pred_depth: Rendered depth from 3DGS [H, W] (can be any scale)
+        gt_depth: Monocular depth prior [H, W] (relative depth, normalized [0, 1])
+        mask: Valid pixel mask [H, W] (optional, defaults to all valid pixels)
+
+    Returns:
+        Scalar loss value
+
+    Reference:
+        Eigen et al., "Depth Map Prediction from a Single Image using a Multi-Scale Deep Network", 2014
+    """
+    # Flatten spatial dimensions
+    pred_flat = pred_depth.reshape(-1)  # [H*W]
+    gt_flat = gt_depth.reshape(-1)      # [H*W]
+
+    # Create mask for valid pixels (non-inf, non-nan)
+    if mask is None:
+        valid_mask = torch.isfinite(pred_flat) & torch.isfinite(gt_flat)
+    else:
+        valid_mask = mask.reshape(-1) & torch.isfinite(pred_flat) & torch.isfinite(gt_flat)
+
+    # Filter valid pixels
+    pred_valid = pred_flat[valid_mask]
+    gt_valid = gt_flat[valid_mask]
+
+    if pred_valid.numel() < 10:
+        # Not enough valid pixels, return zero loss
+        return torch.tensor(0.0, device=pred_depth.device)
+
+    # Solve for optimal scale (s) and shift (t) using least squares
+    # We want to minimize: || s * pred + t - gt ||^2
+    # This is a linear regression problem
+
+    # Design matrix: [pred, 1]  -> [N, 2]
+    A = torch.stack([pred_valid, torch.ones_like(pred_valid)], dim=1)  # [N, 2]
+
+    # Target: gt  -> [N]
+    b = gt_valid  # [N]
+
+    # Solve: (A^T A)^{-1} A^T b
+    # Using pseudo-inverse for numerical stability
+    try:
+        # A^T A: [2, N] @ [N, 2] -> [2, 2]
+        ATA = A.T @ A
+        # A^T b: [2, N] @ [N] -> [2]
+        ATb = A.T @ b
+
+        # Solve linear system
+        params = torch.linalg.solve(ATA, ATb)  # [2]
+        s, t = params[0], params[1]
+    except RuntimeError:
+        # Fallback if matrix is singular
+        s = torch.tensor(1.0, device=pred_depth.device)
+        t = torch.tensor(0.0, device=pred_depth.device)
+
+    # Align prediction
+    pred_aligned = s * pred_flat + t
+
+    # Compute L1 loss on aligned depth (only on valid pixels)
+    loss = torch.abs(pred_aligned[valid_mask] - gt_valid).mean()
+
+    return loss
+
+
 def semantic_loss_with_gating(
     pred_sem: torch.Tensor,
     gt_heatmap: torch.Tensor,
@@ -111,13 +189,15 @@ def render_dual_pass(
     K: torch.Tensor,
     width: int,
     height: int,
-    sh_degree: int = 3
+    sh_degree: int = 3,
+    render_depth: bool = False
 ) -> Dict[str, torch.Tensor]:
     """
     Perform dual-pass rendering for RGB and Semantic channels.
 
     Pass 1 (RGB): Render using SH features for view-dependent color.
     Pass 2 (Semantic): Render semantic probabilities using the same geometry.
+    Pass 3 (Depth): Render depth map if enabled (for depth supervision).
 
     Args:
         model: SemanticGaussianModel
@@ -126,11 +206,14 @@ def render_dual_pass(
         width: Image width
         height: Image height
         sh_degree: Spherical harmonics degree
+        render_depth: Whether to render depth map
 
     Returns:
         Dictionary containing:
             - rgb: Rendered RGB image [H, W, 3]
             - semantic: Rendered semantic probabilities [H, W, K]
+            - depth: Rendered depth [H, W] (if render_depth=True)
+            - alpha: Alpha channel [H, W]
             - meta: Intermediate results from Pass 1
     """
     device = model.params['means'].device
@@ -177,7 +260,53 @@ def render_dual_pass(
     alpha = alpha.squeeze(0).squeeze(-1)
 
     # ========================================================================
-    # Pass 2: Semantic Rendering
+    # Pass 2: Depth Rendering (if enabled)
+    # ========================================================================
+    depth_map = None
+    if render_depth:
+        # Render depth using z-coordinate as color
+        # Extract depth (z-coordinate in camera space) from means
+        # Transform means to camera space: X_cam = R * X_world + T
+        viewmat_expanded = viewmat[None]  # [1, 4, 4]
+        means_homo = torch.cat([means, torch.ones_like(means[:, :1])], dim=1)  # [N, 4]
+        means_cam = (viewmat_expanded @ means_homo.T).T[:, :3]  # [N, 3]
+        z_values = means_cam[:, 2:3]  # [N, 1] - depth in camera space
+
+        # Normalize z-values to [0, 1] range for rendering
+        z_min = z_values.min()
+        z_max = z_values.max()
+        if z_max > z_min:
+            z_normalized = (z_values - z_min) / (z_max - z_min)  # [N, 1]
+        else:
+            z_normalized = torch.zeros_like(z_values)
+
+        # Render as single-channel "color"
+        colors_depth = z_normalized.repeat(1, 3)[None]  # [1, N, 3]
+
+        depth_render, _, _ = rasterization(
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities,
+            colors=colors_depth,
+            viewmats=viewmat[None],  # [1, 4, 4]
+            Ks=K[None],  # [1, 3, 3]
+            width=width,
+            height=height,
+            sh_degree=None,  # No SH for depth
+            packed=True,
+            absgrad=True
+        )
+
+        # depth_render: [1, H, W, 3] -> [H, W] (take R channel)
+        depth_map = depth_render.squeeze(0)[..., 0]  # [H, W]
+
+        # Denormalize back to actual depth values
+        if z_max > z_min:
+            depth_map = depth_map * (z_max - z_min) + z_min
+
+    # ========================================================================
+    # Pass 3: Semantic Rendering
     # ========================================================================
     # Get semantic probabilities [N, K]
     sem_probs = model.get_semantic  # [N, K]
@@ -244,12 +373,18 @@ def render_dual_pass(
     # Retain gradients for densification
     meta['means2d'].retain_grad()
 
-    return {
+    result = {
         'rgb': rgb,        # [H, W, 3]
         'semantic': sem_map,  # [H, W, 4]
         'alpha': alpha,     # [H, W]
         'meta': meta        # Dict containing intermediate results
     }
+
+    # Add depth map if rendered
+    if depth_map is not None:
+        result['depth'] = depth_map
+
+    return result
 
 
 # ============================================================================
@@ -263,11 +398,13 @@ def train(
     heatmap_dir: str,
     confidence_path: str,
     pcd_path: str,
+    depth_dir: str = None,  # New: path to depth maps
 
     # Training settings
     num_iterations: int = 7000,
     warmup_iterations: int = 4000,  # "Geometry First": RGB builds cylindrical volume before semantic classification
     lambda_sem: float = 0.05,
+    lambda_depth: float = 0.1,  # New: depth loss weight
     lr_scale: float = 1.0,
     spatial_lr_scale: float = 1.0,
 
@@ -290,7 +427,7 @@ def train(
     device: str = "cuda"
 ):
     """
-    Main training loop for semantic 3D Gaussian Splatting.
+    Main training loop for semantic 3D Gaussian Splatting with depth supervision.
 
     Args:
         colmap_dir: Path to COLMAP output
@@ -298,9 +435,11 @@ def train(
         heatmap_dir: Path to heatmap .npy files
         confidence_path: Path to confidence JSON
         pcd_path: Path to COLMAP point cloud (.ply)
+        depth_dir: Path to depth map .png files (optional)
         num_iterations: Total training iterations
         warmup_iterations: Iterations for geometric warm-up (lambda_sem=0)
         lambda_sem: Semantic loss weight after warm-up
+        lambda_depth: Depth loss weight (scale-invariant)
         lr_scale: Global learning rate scale
         spatial_lr_scale: Spatial learning rate scale
         sh_degree: Spherical harmonics degree
@@ -336,7 +475,8 @@ def train(
         colmap_dir=colmap_dir,
         images_dir=images_dir,
         heatmap_dir=heatmap_dir,
-        confidence_path=confidence_path
+        confidence_path=confidence_path,
+        depth_dir=depth_dir  # Pass depth directory
     )
 
     dataloader = create_dataloader(
@@ -344,12 +484,16 @@ def train(
         images_dir=images_dir,
         heatmap_dir=heatmap_dir,
         confidence_path=confidence_path,
+        depth_dir=depth_dir,  # Pass depth directory
         batch_size=1,
         num_workers=0,  # Windows compatibility: must be 0 to avoid multiprocessing issues
         shuffle=True
     )
 
+    # Check if depth data is available
+    has_depth = depth_dir is not None and any(data.get('has_depth', False) for data in dataset.cached_data)
     print(f"Dataset: {len(dataset)} frames")
+    print(f"Depth supervision: {'Enabled' if has_depth else 'Disabled'}")
 
     # ========================================================================
     # Initialize Optimizers (Dictionary for DefaultStrategy)
@@ -399,6 +543,8 @@ def train(
     print(f"Total iterations: {num_iterations}")
     print(f"Warm-up iterations: {warmup_iterations} (lambda_sem=0)")
     print(f"Lambda_sem after warm-up: {lambda_sem}")
+    if has_depth:
+        print(f"Lambda_depth: {lambda_depth}")
 
     iteration = 0
     train_losses = []
@@ -423,6 +569,11 @@ def train(
         confidence = data['confidence'].squeeze(0)  # [K], CPU
         viewmat = data['viewmat'].squeeze(0)  # [4, 4], CPU
         K = data['K'].clone().squeeze(0)  # [3, 3], CPU (clone to avoid in-place modification)
+
+        # Extract depth if available
+        gt_depth = None
+        if 'depth' in data:
+            gt_depth = data['depth'].squeeze(0)  # [H, W], CPU
 
         # ====================================================================
         # Apply Resolution Scaling (Performance Optimization)
@@ -460,6 +611,8 @@ def train(
         confidence = confidence.to(device)
         viewmat = viewmat.to(device)
         K = K.to(device)
+        if gt_depth is not None:
+            gt_depth = gt_depth.to(device)
 
         H, W = image.shape[:2]
 
@@ -470,26 +623,44 @@ def train(
         for optimizer in optimizers.values():
             optimizer.zero_grad()
 
-        # Render both RGB and Semantic
+        # Render RGB, Semantic, and Depth (if available)
         renders = render_dual_pass(
             model=model,
             viewmat=viewmat,
             K=K,
             width=W,
             height=H,
-            sh_degree=sh_degree
+            sh_degree=sh_degree,
+            render_depth=(gt_depth is not None)  # Enable depth rendering if GT depth available
         )
 
         pred_rgb = renders['rgb']  # [H, W, 3]
         pred_sem = renders['semantic']  # [H, W, K]
         alpha = renders['alpha']  # [H, W]
         meta = renders['meta']  # Dict with intermediate results
+        pred_depth = renders.get('depth', None)  # [H, W] if depth was rendered
 
         # ====================================================================
         # Compute Losses
         # ====================================================================
         # RGB loss (L1)
         loss_rgb = l1_loss(pred_rgb, image)
+
+        # Depth loss (scale-invariant, if available)
+        loss_depth = torch.tensor(0.0, device=device)
+        if pred_depth is not None and gt_depth is not None:
+            # Ensure GT depth matches rendered resolution
+            if gt_depth.shape != pred_depth.shape:
+                gt_depth_resized = torch.nn.functional.interpolate(
+                    gt_depth.unsqueeze(0).unsqueeze(0),  # [1, 1, H, W]
+                    size=pred_depth.shape,
+                    mode='bilinear',
+                    align_corners=False
+                ).squeeze()  # [H, W]
+            else:
+                gt_depth_resized = gt_depth
+
+            loss_depth = scale_invariant_depth_loss(pred_depth, gt_depth_resized)
 
         # Semantic loss (if past warm-up)
         if iteration < warmup_iterations:
@@ -504,8 +675,8 @@ def train(
             )
             current_lambda_sem = lambda_sem
 
-        # Total loss
-        total_loss = loss_rgb + current_lambda_sem * loss_sem
+        # Total loss: RGB + Depth + Semantic
+        total_loss = loss_rgb + lambda_depth * loss_depth + current_lambda_sem * loss_sem
 
         train_losses.append(total_loss.item())
 
@@ -591,7 +762,8 @@ def train(
 
             print(f"Iter {iteration:5d} | "
                   f"Loss: {total_loss.item():.6f} (RGB: {loss_rgb.item():.6f}, "
-                  f"Sem: {loss_sem.item():.6f}, lambda: {current_lambda_sem:.3f}) | "
+                  f"Depth: {loss_depth.item():.6f}, "
+                  f"Sem: {loss_sem.item():.6f}, lambda_sem: {current_lambda_sem:.3f}) | "
                   f"Gaussians: {model.num_gaussians()} | "
                   f"Max Grad Norm: {max_grad_norm:.6f} | "
                   f"Time: {elapsed:.1f}s / ETA: {remaining:.1f}s")
@@ -642,11 +814,13 @@ if __name__ == "__main__":
         heatmap_dir=r"D:\PythonProject\PythonProject\data\heatmaps\heatmap_video2_stem",
         confidence_path=r"D:\PythonProject\PythonProject\data\heatmaps\confidence_video2_stem.json",
         pcd_path=r"D:\PythonProject\PythonProject\data\video_data\colmap_data\video2_output_ply\sparse\0\points3D.ply",
+        depth_dir=r"D:\PythonProject\PythonProject\data\depths\video2_depths",  # New: depth maps directory
 
         # Training settings
         num_iterations=20000,
         warmup_iterations=4000,    # "Geometry First": RGB builds cylindrical volume before semantic classification
         lambda_sem=0.2,            # Standard weight (skeleton supervision is already strong)
+        lambda_depth=0.1,          # New: depth loss weight (scale-invariant)
         lr_scale=1.0,
         spatial_lr_scale=1.0,
 
@@ -660,7 +834,7 @@ if __name__ == "__main__":
         # Logging
         log_every=100,
         save_every=5000,
-        output_dir=r"D:\PythonProject\PythonProject\output\video2_skeleton_supervision",
+        output_dir=r"D:\PythonProject\PythonProject\output\video2_depth_supervision",  # Updated output directory
 
         # Device
         device="cuda" if torch.cuda.is_available() else "cpu"

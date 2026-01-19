@@ -276,8 +276,8 @@ def get_intrinsics_from_camera(camera: Dict) -> np.ndarray:
 
 class TomatoDataset(Dataset):
     """
-    PyTorch Dataset for loading RGB images, camera parameters, and semantic heatmaps
-    for tomato plant phenotype analysis with gsplat v1.5.3.
+    PyTorch Dataset for loading RGB images, camera parameters, semantic heatmaps,
+    and depth maps for tomato plant phenotype analysis with gsplat v1.5.3.
 
     Expected directory structure:
         colmap_dir/
@@ -294,6 +294,10 @@ class TomatoDataset(Dataset):
             image_002.npy
             ...
         confidence_path: confidence.json
+        depth_dir/ (optional)
+            image_001.png
+            image_002.png
+            ...
 
     The confidence JSON should have the format:
         {
@@ -309,6 +313,7 @@ class TomatoDataset(Dataset):
         images_dir: str,
         heatmap_dir: str,
         confidence_path: str,
+        depth_dir: str = None,
         split: str = "train"
     ):
         """
@@ -319,11 +324,13 @@ class TomatoDataset(Dataset):
             images_dir: Path to RGB images directory
             heatmap_dir: Path to heatmap .npy files directory
             confidence_path: Path to confidence JSON file
+            depth_dir: Path to depth map .png files directory (optional)
             split: Dataset split ("train" or "val"), currently unused
         """
         self.colmap_dir = colmap_dir
         self.images_dir = images_dir
         self.heatmap_dir = heatmap_dir
+        self.depth_dir = depth_dir
         self.split = split
 
         # Parse COLMAP data
@@ -343,6 +350,12 @@ class TomatoDataset(Dataset):
         with open(confidence_path, 'r') as f:
             self.confidence_dict = json.load(f)
         print(f"Loaded confidence data for {len(self.confidence_dict)} frames")
+
+        # Validate depth directory if provided
+        if depth_dir is not None:
+            if not os.path.exists(depth_dir):
+                warnings.warn(f"Depth directory not found: {depth_dir}, disabling depth loading")
+                self.depth_dir = None
 
         # Match and cache all data
         self._cache_data()
@@ -371,6 +384,14 @@ class TomatoDataset(Dataset):
                 warnings.warn(f"Confidence data not found for: {name_without_ext}, skipping")
                 continue
 
+            # Check if depth map exists (if depth_dir is provided)
+            has_depth = False
+            if self.depth_dir is not None:
+                depth_path = os.path.join(self.depth_dir, name_without_ext + ".png")
+                has_depth = os.path.exists(depth_path)
+                if not has_depth:
+                    warnings.warn(f"Depth map not found for: {image_basename}, will skip depth for this frame")
+
             # Get camera parameters
             camera_id = img_data['camera_id']
             if camera_id not in self.cameras:
@@ -387,7 +408,8 @@ class TomatoDataset(Dataset):
                 'camera': camera,
                 'R': img_data['R'],
                 'tvec': img_data['tvec'],
-                'camera_id': camera_id
+                'camera_id': camera_id,
+                'has_depth': has_depth
             })
 
         print(f"Successfully cached {len(self.cached_data)} valid frames")
@@ -429,6 +451,19 @@ class TomatoDataset(Dataset):
         conf_vec = self.confidence_dict[name_without_ext]
         confidence_tensor = torch.tensor(conf_vec, dtype=torch.float32)  # [K]
 
+        # Load depth map if available
+        depth_tensor = None
+        if data['has_depth'] and self.depth_dir is not None:
+            depth_path = os.path.join(self.depth_dir, name_without_ext + ".png")
+            try:
+                # Load 16-bit PNG and normalize to [0, 1]
+                depth_16bit = np.array(Image.open(depth_path), dtype=np.float32)
+                depth_np = depth_16bit / 65535.0  # Convert from [0, 65535] to [0, 1]
+                depth_tensor = torch.from_numpy(depth_np)  # [H, W]
+            except Exception as e:
+                warnings.warn(f"Failed to load depth map for {name_without_ext}: {e}")
+                depth_tensor = None
+
         # Get camera intrinsics
         K_np = get_intrinsics_from_camera(data['camera'])
         K_tensor = torch.from_numpy(K_np)  # [3, 3]
@@ -450,7 +485,7 @@ class TomatoDataset(Dataset):
 
         viewmat_tensor = torch.from_numpy(viewmat)  # [4, 4]
 
-        return {
+        result = {
             'image': image_tensor,
             'heatmap': heatmap_tensor,
             'confidence': confidence_tensor,
@@ -460,6 +495,12 @@ class TomatoDataset(Dataset):
             'width': W,
             'image_id': data['image_id']
         }
+
+        # Add depth tensor if available
+        if depth_tensor is not None:
+            result['depth'] = depth_tensor
+
+        return result
 
 
 # ============================================================================
@@ -471,6 +512,7 @@ def create_dataloader(
     images_dir: str,
     heatmap_dir: str,
     confidence_path: str,
+    depth_dir: str = None,
     batch_size: int = 1,
     num_workers: int = 4,
     shuffle: bool = True
@@ -483,6 +525,7 @@ def create_dataloader(
         images_dir: Path to RGB images directory
         heatmap_dir: Path to heatmap .npy files directory
         confidence_path: Path to confidence JSON file
+        depth_dir: Path to depth map .png files directory (optional)
         batch_size: Batch size
         num_workers: Number of worker processes
         shuffle: Whether to shuffle the data
@@ -494,7 +537,8 @@ def create_dataloader(
         colmap_dir=colmap_dir,
         images_dir=images_dir,
         heatmap_dir=heatmap_dir,
-        confidence_path=confidence_path
+        confidence_path=confidence_path,
+        depth_dir=depth_dir
     )
 
     dataloader = torch.utils.data.DataLoader(
