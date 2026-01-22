@@ -75,6 +75,9 @@ def train(
     # Loss weights
     fg_weight: float = 20.0,
 
+    # Sparse Semantic Supervision
+    confidence_threshold: float = 0.5,  # YOLO confidence threshold for semantic validity
+
     # Performance optimization
     resolution_scale: float = 0.75,  # Full resolution for skeleton supervision (no downscaling)
 
@@ -95,7 +98,7 @@ def train(
         heatmap_dir: Path to heatmap .npy files
         confidence_path: Path to confidence JSON
         pcd_path: Path to COLMAP point cloud (.ply)
-        depth_dir: Path to depth map .png files (optional)
+        depth_dir: Path to depth map .npz files (optional)
         num_iterations: Total training iterations
         warmup_iterations: Iterations for geometric warm-up (lambda_sem=0)
         lambda_sem: Semantic loss weight after warm-up
@@ -105,6 +108,7 @@ def train(
         sh_degree: Spherical harmonics degree
         num_classes: Number of semantic classes
         fg_weight: Foreground pixel weight for semantic loss
+        confidence_threshold: YOLO confidence threshold for semantic validity
         log_every: Log interval
         save_every: Save checkpoint interval
         output_dir: Output directory for checkpoints
@@ -136,7 +140,8 @@ def train(
         images_dir=images_dir,
         heatmap_dir=heatmap_dir,
         confidence_path=confidence_path,
-        depth_dir=depth_dir  # Pass depth directory
+        depth_dir=depth_dir,  # Pass depth directory
+        confidence_threshold=confidence_threshold  # Pass confidence threshold
     )
 
     dataloader = create_dataloader(
@@ -145,6 +150,7 @@ def train(
         heatmap_dir=heatmap_dir,
         confidence_path=confidence_path,
         depth_dir=depth_dir,  # Pass depth directory
+        confidence_threshold=confidence_threshold,  # Pass confidence threshold
         batch_size=1,
         num_workers=0,  # Windows compatibility: must be 0 to avoid multiprocessing issues
         shuffle=True
@@ -152,8 +158,16 @@ def train(
 
     # Check if depth data is available
     has_depth = depth_dir is not None and any(data.get('has_depth', False) for data in dataset.cached_data)
+
+    # Compute sparse semantic supervision statistics
+    valid_semantic_frames = sum(
+        1 for data in dataset.cached_data
+        if max(dataset.confidence_dict[data['name_without_ext']]) >= confidence_threshold
+    )
     print(f"Dataset: {len(dataset)} frames")
     print(f"Depth supervision: {'Enabled' if has_depth else 'Disabled'}")
+    print(f"Sparse semantic supervision: {valid_semantic_frames}/{len(dataset)} frames ({100*valid_semantic_frames/len(dataset):.1f}%)")
+    print(f"Confidence threshold: {confidence_threshold}")
 
     # ========================================================================
     # Initialize Optimizers (Dictionary for DefaultStrategy)
@@ -229,6 +243,7 @@ def train(
         confidence = data['confidence'].squeeze(0)  # [K], CPU
         viewmat = data['viewmat'].squeeze(0)  # [4, 4], CPU
         K = data['K'].clone().squeeze(0)  # [3, 3], CPU (clone to avoid in-place modification)
+        sem_mask = data['sem_mask'].squeeze(0)  # [1], CPU - semantic validity mask
 
         # Extract depth if available
         gt_depth = None
@@ -271,6 +286,7 @@ def train(
         confidence = confidence.to(device)
         viewmat = viewmat.to(device)
         K = K.to(device)
+        sem_mask = sem_mask.to(device)  # Move sem_mask to device
         if gt_depth is not None:
             gt_depth = gt_depth.to(device)
 
@@ -327,12 +343,20 @@ def train(
             loss_sem = torch.tensor(0.0, device=device)
             current_lambda_sem = 0.0
         else:
-            loss_sem = semantic_loss_with_gating(
+            # Compute base semantic loss
+            loss_sem_base = semantic_loss_with_gating(
                 pred_sem=pred_sem,
                 gt_heatmap=heatmap,
                 confidence=confidence,
                 fg_weight=fg_weight
             )
+
+            # Apply sparse semantic supervision: Multiply by sem_mask
+            # If frame is low-confidence (sem_mask=0), semantic loss is disabled
+            # If frame is high-confidence (sem_mask=1), semantic loss is enabled
+            # This prevents "Negative Supervision" from occluded/blurry frames
+            loss_sem = loss_sem_base * sem_mask
+
             current_lambda_sem = lambda_sem
 
         # Total loss: RGB + Depth + Semantic
@@ -420,10 +444,14 @@ def train(
             if model.params['means'].grad is not None:
                 max_grad_norm = model.params['means'].grad.norm(dim=-1).max().item()
 
+            # Log semantic mask status for debugging
+            sem_mask_val = sem_mask.item()
+            sem_status = "ENABLED" if sem_mask_val > 0.5 else "DISABLED"
+
             print(f"Iter {iteration:5d} | "
                   f"Loss: {total_loss.item():.6f} (RGB: {loss_rgb.item():.6f}, "
                   f"Depth: {loss_depth.item():.6f}, "
-                  f"Sem: {loss_sem.item():.6f}, lambda_sem: {current_lambda_sem:.3f}) | "
+                  f"Sem: {loss_sem.item():.6f} [{sem_status}], lambda_sem: {current_lambda_sem:.3f}) | "
                   f"Gaussians: {model.num_gaussians()} | "
                   f"Max Grad Norm: {max_grad_norm:.6f} | "
                   f"Time: {elapsed:.1f}s / ETA: {remaining:.1f}s")

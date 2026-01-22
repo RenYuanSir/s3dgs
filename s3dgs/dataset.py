@@ -314,6 +314,7 @@ class TomatoDataset(Dataset):
         heatmap_dir: str,
         confidence_path: str,
         depth_dir: str = None,
+        confidence_threshold: float = 0.5,
         split: str = "train"
     ):
         """
@@ -324,13 +325,15 @@ class TomatoDataset(Dataset):
             images_dir: Path to RGB images directory
             heatmap_dir: Path to heatmap .npy files directory
             confidence_path: Path to confidence JSON file
-            depth_dir: Path to depth map .png files directory (optional)
+            depth_dir: Path to depth map .npz files directory (optional)
+            confidence_threshold: YOLO confidence threshold for semantic validity (default: 0.5)
             split: Dataset split ("train" or "val"), currently unused
         """
         self.colmap_dir = colmap_dir
         self.images_dir = images_dir
         self.heatmap_dir = heatmap_dir
         self.depth_dir = depth_dir
+        self.confidence_threshold = confidence_threshold
         self.split = split
 
         # Parse COLMAP data
@@ -387,8 +390,12 @@ class TomatoDataset(Dataset):
             # Check if depth map exists (if depth_dir is provided)
             has_depth = False
             if self.depth_dir is not None:
-                depth_path = os.path.join(self.depth_dir, name_without_ext + ".png")
-                has_depth = os.path.exists(depth_path)
+                # Support both .npz (DA3 format) and .png formats
+                for ext in ['.npz', '.png']:
+                    depth_path = os.path.join(self.depth_dir, name_without_ext + ext)
+                    if os.path.exists(depth_path):
+                        has_depth = True
+                        break
                 if not has_depth:
                     warnings.warn(f"Depth map not found for: {image_basename}, will skip depth for this frame")
 
@@ -431,6 +438,8 @@ class TomatoDataset(Dataset):
                 - height: int
                 - width: int
                 - image_id: int
+                - depth: Tensor [H, W], depth map (optional, if available)
+                - sem_mask: Tensor [1], semantic validity mask (1.0 if high-confidence keyframe, 0.0 otherwise)
         """
         data = self.cached_data[idx]
         name_without_ext = data['name_without_ext']
@@ -454,12 +463,28 @@ class TomatoDataset(Dataset):
         # Load depth map if available
         depth_tensor = None
         if data['has_depth'] and self.depth_dir is not None:
-            depth_path = os.path.join(self.depth_dir, name_without_ext + ".png")
+            # Try .npz format (DA3) first, then fallback to .png
+            depth_path_npz = os.path.join(self.depth_dir, name_without_ext + ".npz")
+            depth_path_png = os.path.join(self.depth_dir, name_without_ext + ".png")
+
             try:
-                # Load 16-bit PNG and normalize to [0, 1]
-                depth_16bit = np.array(Image.open(depth_path), dtype=np.float32)
-                depth_np = depth_16bit / 65535.0  # Convert from [0, 65535] to [0, 1]
-                depth_tensor = torch.from_numpy(depth_np)  # [H, W]
+                if os.path.exists(depth_path_npz):
+                    # Load DA3 .npz format (contains 'depth' key)
+                    depth_data = np.load(depth_path_npz)
+                    if 'depth' in depth_data:
+                        depth_np = depth_data['depth'].astype(np.float32)
+                    else:
+                        # Fallback: assume first array is depth
+                        depth_np = depth_data[list(depth_data.keys())[0]].astype(np.float32)
+                    # Normalize to [0, 1] if not already
+                    if depth_np.max() > 1.0:
+                        depth_np = depth_np / depth_np.max()
+                    depth_tensor = torch.from_numpy(depth_np)  # [H, W]
+                elif os.path.exists(depth_path_png):
+                    # Load 16-bit PNG and normalize to [0, 1]
+                    depth_16bit = np.array(Image.open(depth_path_png), dtype=np.float32)
+                    depth_np = depth_16bit / 65535.0  # Convert from [0, 65535] to [0, 1]
+                    depth_tensor = torch.from_numpy(depth_np)  # [H, W]
             except Exception as e:
                 warnings.warn(f"Failed to load depth map for {name_without_ext}: {e}")
                 depth_tensor = None
@@ -485,6 +510,14 @@ class TomatoDataset(Dataset):
 
         viewmat_tensor = torch.from_numpy(viewmat)  # [4, 4]
 
+        # Compute semantic validity mask based on YOLO confidence
+        # Logic: If frame is high-confidence "Keyframe" (any class > threshold), mask = 1.0, else 0.0
+        # This prevents "Negative Supervision" from low-confidence/occluded/blurry frames
+        conf_vec = self.confidence_dict[name_without_ext]  # [K]
+        max_confidence = max(conf_vec)  # Get maximum confidence across all classes
+        sem_mask = 1.0 if max_confidence >= self.confidence_threshold else 0.0
+        sem_mask_tensor = torch.tensor([sem_mask], dtype=torch.float32)  # [1]
+
         result = {
             'image': image_tensor,
             'heatmap': heatmap_tensor,
@@ -493,7 +526,8 @@ class TomatoDataset(Dataset):
             'K': K_tensor,
             'height': H,
             'width': W,
-            'image_id': data['image_id']
+            'image_id': data['image_id'],
+            'sem_mask': sem_mask_tensor  # Always include sem_mask
         }
 
         # Add depth tensor if available
@@ -513,6 +547,7 @@ def create_dataloader(
     heatmap_dir: str,
     confidence_path: str,
     depth_dir: str = None,
+    confidence_threshold: float = 0.5,
     batch_size: int = 1,
     num_workers: int = 4,
     shuffle: bool = True
@@ -525,7 +560,8 @@ def create_dataloader(
         images_dir: Path to RGB images directory
         heatmap_dir: Path to heatmap .npy files directory
         confidence_path: Path to confidence JSON file
-        depth_dir: Path to depth map .png files directory (optional)
+        depth_dir: Path to depth map .npz files directory (optional)
+        confidence_threshold: YOLO confidence threshold for semantic validity (default: 0.5)
         batch_size: Batch size
         num_workers: Number of worker processes
         shuffle: Whether to shuffle the data
@@ -538,7 +574,8 @@ def create_dataloader(
         images_dir=images_dir,
         heatmap_dir=heatmap_dir,
         confidence_path=confidence_path,
-        depth_dir=depth_dir
+        depth_dir=depth_dir,
+        confidence_threshold=confidence_threshold
     )
 
     dataloader = torch.utils.data.DataLoader(
