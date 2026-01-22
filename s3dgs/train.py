@@ -58,7 +58,8 @@ def train(
     heatmap_dir: str,
     confidence_path: str,
     pcd_path: str,
-    depth_dir: str = None,  # New: path to depth maps
+    depth_dir: str = None,  # Path to individual depth maps
+    depth_npz_path: str = None,  # New: path to unified DA3 NPZ file
 
     # Training settings
     num_iterations: int = 7000,
@@ -98,7 +99,8 @@ def train(
         heatmap_dir: Path to heatmap .npy files
         confidence_path: Path to confidence JSON
         pcd_path: Path to COLMAP point cloud (.ply)
-        depth_dir: Path to depth map .npz files (optional)
+        depth_dir: Path to individual depth map .npz/.png files (optional)
+        depth_npz_path: Path to unified DA3 results NPZ file (optional, takes precedence)
         num_iterations: Total training iterations
         warmup_iterations: Iterations for geometric warm-up (lambda_sem=0)
         lambda_sem: Semantic loss weight after warm-up
@@ -141,6 +143,7 @@ def train(
         heatmap_dir=heatmap_dir,
         confidence_path=confidence_path,
         depth_dir=depth_dir,  # Pass depth directory
+        depth_npz_path=depth_npz_path,  # Pass unified NPZ path
         confidence_threshold=confidence_threshold  # Pass confidence threshold
     )
 
@@ -150,6 +153,7 @@ def train(
         heatmap_dir=heatmap_dir,
         confidence_path=confidence_path,
         depth_dir=depth_dir,  # Pass depth directory
+        depth_npz_path=depth_npz_path,  # Pass unified NPZ path
         confidence_threshold=confidence_threshold,  # Pass confidence threshold
         batch_size=1,
         num_workers=0,  # Windows compatibility: must be 0 to avoid multiprocessing issues
@@ -157,7 +161,8 @@ def train(
     )
 
     # Check if depth data is available
-    has_depth = depth_dir is not None and any(data.get('has_depth', False) for data in dataset.cached_data)
+    has_depth = (depth_dir is not None or depth_npz_path is not None) and \
+                any(data.get('has_depth', False) for data in dataset.cached_data)
 
     # Compute sparse semantic supervision statistics
     valid_semantic_frames = sum(
