@@ -232,9 +232,9 @@ def main():
     # ========================================================================
     # Configuration (UPDATE THESE PATHS)
     # ========================================================================
-    npz_path = "./data/da3_results.npz"  # Path to unified DA3 results
-    images_dir = "./data/images"          # Path to original RGB images
-    output_path = "./test/depth_alignment_visualization.png"
+    npz_path = r"D:\EdgeDownloads\results.npz"  # Path to unified DA3 results
+    images_dir = r"D:\PythonProject\PythonProject\data\video_data\frames\video2_frame"          # Path to original RGB images
+    output_path = r"D:\PythonProject\PythonProject\debug\depth_vis"
 
     # Check if paths exist
     if not os.path.exists(npz_path):
