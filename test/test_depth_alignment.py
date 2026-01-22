@@ -106,18 +106,33 @@ def depth_to_colormap(depth: np.ndarray) -> np.ndarray:
     """
     Convert depth map to colormap for visualization.
 
+    NOTE: Depth Anything V3 outputs metric depth where:
+    - Smaller values = closer to camera
+    - Larger values = farther from camera
+
+    For visualization, we want:
+    - Red/Warm colors = close (small depth values)
+    - Blue/Cool colors = far (large depth values)
+
     Args:
         depth: Depth map [H, W]
 
     Returns:
         RGB colormap [H, W, 3]
     """
-    # Normalize to [0, 1]
-    depth_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+    # Normalize to [0, 1] - smaller is closer
+    depth_min = depth.min()
+    depth_max = depth.max()
+    depth_norm = (depth - depth_min) / (depth_max - depth_min + 1e-8)
+
+    # INVERT for visualization: we want close objects = RED, far = BLUE
+    # COLORMAP_TURBO: Blue (0) -> Red (255)
+    # So we need to invert: 1.0 - depth_norm
+    depth_vis = 1.0 - depth_norm
 
     # Apply colormap
     depth_colormap = cv2.applyColorMap(
-        (depth_norm * 255).astype(np.uint8),
+        (depth_vis * 255).astype(np.uint8),
         cv2.COLORMAP_TURBO
     )
 
