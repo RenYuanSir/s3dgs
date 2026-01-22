@@ -67,7 +67,7 @@ Thumbs.db
 *.bak
 
 # Test files
-test/
+# test/  # Commented out to allow test scripts version control
 tests/
 *.test.py
 
