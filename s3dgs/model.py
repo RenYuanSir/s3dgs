@@ -26,6 +26,8 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple
 from scipy.spatial import KDTree
 import plyfile
+import os
+from pathlib import Path
 
 
 class SemanticGaussianModel(nn.Module):
@@ -58,13 +60,27 @@ class SemanticGaussianModel(nn.Module):
         # Initialize ParameterDict (will be populated in create_from_pcd)
         self.params = nn.ParameterDict()
 
-    def create_from_pcd(self, pcd_path: str, spatial_lr_scale: float = 1.0):
+    def create_from_pcd(
+        self,
+        pcd_path: str,
+        spatial_lr_scale: float = 1.0,
+        min_scale_threshold: float = 0.005
+    ):
         """
         Initialize Gaussian parameters from a point cloud file.
+
+        Supports robust initialization from dense point clouds (DA3) with:
+        - Scale floor to prevent scale collapse in dense clouds
+        - Optional semantic prior loading from precomputed .pt files
 
         Args:
             pcd_path: Path to PLY or TXT file containing points with RGB
             spatial_lr_scale: Spatial learning rate scale factor
+            min_scale_threshold: Minimum scale threshold to prevent collapse.
+                                 For dense clouds (~500k points), KNN distances
+                                 can be ~1e-5, causing scale collapse. This ensures
+                                 every Gaussian covers at least ~1 pixel initially.
+                                 Default: 0.005 (assuming world scale ~1.0)
         """
         # Load point cloud
         xyz, rgb = self._load_point_cloud(pcd_path)
@@ -75,10 +91,15 @@ class SemanticGaussianModel(nn.Module):
         # Position: directly from point cloud
         self.params['means'] = nn.Parameter(torch.tensor(xyz, dtype=torch.float32))
 
-        # Scale: based on KNN distances
+        # Scale: based on KNN distances with robust scale floor
         kdtree = KDTree(xyz)
         distances, _ = kdtree.query(xyz, k=4)  # k=4 because first point is itself
         mean_distances = np.mean(distances[:, 1:], axis=1)  # Skip first (self)
+
+        # CRITICAL: Apply scale floor to prevent collapse in dense clouds
+        # For dense point clouds (500k+ points), KNN distance can be ~1e-5,
+        # leading to scales too small for gradient propagation.
+        mean_distances = np.maximum(mean_distances, min_scale_threshold)
 
         # Convert to log-space (inverse of exp activation)
         scales = np.tile(np.log(mean_distances)[:, np.newaxis], (1, 3))
@@ -112,12 +133,110 @@ class SemanticGaussianModel(nn.Module):
                 torch.zeros((num_points, 0, 3), dtype=torch.float32)
             )
 
-        # 3. Semantic Initialization
-        # Initialize with small random noise to break symmetry
-        semantic_init = torch.randn(num_points, self._num_classes) * 0.01
+        # 3. Semantic Initialization with Pre-computed Prior Support
+        # Try to load precomputed semantic priors from .pt file
+        semantic_init = self._load_semantic_priors(pcd_path, num_points)
+
         self.params['semantic'] = nn.Parameter(semantic_init.to(torch.float32))
 
         print(f"Initialized {num_points} Gaussians with {self._num_classes} semantic classes")
+        print(f"  Scale threshold applied: {min_scale_threshold:.6f}")
+        print(f"  Semantic prior loaded: {semantic_init.shape}")
+
+    def _load_semantic_priors(self, pcd_path: str, num_points: int) -> torch.Tensor:
+        """
+        Load precomputed semantic priors from a .pt file.
+
+        Looks for a corresponding semantic file:
+        - If pcd_path is 'point.ply', looks for 'point_semantic.pt'
+        - If pcd_path is 'point.ply', looks for 'point_semantic.pt'
+
+        The .pt file should contain a dictionary with:
+            {'semantics': tensor [N, K]}  # Probability distribution
+
+        Args:
+            pcd_path: Path to the point cloud file
+            num_points: Number of points for shape validation
+
+        Returns:
+            Semantic logits tensor [N, num_classes] in log-space
+        """
+        # Generate expected semantic file path
+        pcd_path_obj = Path(pcd_path)
+
+        # Try multiple naming conventions
+        possible_names = [
+            pcd_path_obj.stem + "_semantic.pt",  # point_semantic.pt
+            pcd_path_obj.stem + "_semantics.pt",  # point_semantics.pt
+            pcd_path_obj.name.replace(".ply", "_semantic.pt").replace(".txt", "_semantic.pt"),
+        ]
+
+        semantic_file = None
+        for name in possible_names:
+            candidate = pcd_path_obj.parent / name
+            if candidate.exists():
+                semantic_file = candidate
+                break
+
+        # If no semantic file found, use random initialization
+        if semantic_file is None:
+            print(f"  [Semantic] No precomputed semantic file found. Using random initialization.")
+            semantic_init = torch.randn(num_points, self._num_classes) * 0.01
+            return semantic_init
+
+        # Load semantic priors
+        print(f"  [Semantic] Loading precomputed semantics from: {semantic_file}")
+
+        try:
+            semantic_data = torch.load(semantic_file, map_location="cpu")
+
+            # Support both direct tensor and dict format
+            if isinstance(semantic_data, dict):
+                if 'semantics' in semantic_data:
+                    probs = semantic_data['semantics']
+                else:
+                    raise KeyError("Semantic dict must contain 'semantics' key")
+            elif isinstance(semantic_data, torch.Tensor):
+                probs = semantic_data
+            else:
+                raise TypeError(f"Unsupported semantic data type: {type(semantic_data)}")
+
+            # Validate shape
+            if probs.shape[0] != num_points:
+                raise ValueError(
+                    f"Semantic count mismatch: {probs.shape[0]} vs {num_points} points. "
+                    f"Ensure the semantic file matches the point cloud."
+                )
+
+            if probs.shape[1] != self._num_classes:
+                print(
+                    f"  [Semantic] Warning: Class count mismatch ({probs.shape[1]} vs {self._num_classes}). "
+                    f"Truncating or padding to match model config."
+                )
+                # Truncate or pad to match num_classes
+                if probs.shape[1] > self._num_classes:
+                    probs = probs[:, :self._num_classes]
+                else:
+                    pad_size = self._num_classes - probs.shape[1]
+                    padding = torch.zeros(probs.shape[0], pad_size)
+                    probs = torch.cat([probs, padding], dim=1)
+                # Renormalize
+                probs = probs / probs.sum(dim=1, keepdim=True)
+
+            # Convert probabilities to logits (log-space for numerical stability)
+            # Add epsilon to prevent log(0)
+            semantic_logits = torch.log(probs + 1e-6)
+
+            print(f"  [Semantic] Loaded semantic prior: {semantic_logits.shape}")
+            print(f"  [Semantic] Stats - mean: {semantic_logits.mean():.4f}, std: {semantic_logits.std():.4f}")
+
+            return semantic_logits
+
+        except Exception as e:
+            print(f"  [Semantic] Error loading semantic file: {e}")
+            print(f"  [Semantic] Falling back to random initialization.")
+            semantic_init = torch.randn(num_points, self._num_classes) * 0.01
+            return semantic_init
 
     def _load_point_cloud(self, pcd_path: str) -> Tuple[np.ndarray, np.ndarray]:
         """
