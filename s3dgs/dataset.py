@@ -18,6 +18,7 @@ from PIL import Image
 import json
 from typing import Dict, List, Tuple, Optional
 import warnings
+import cv2
 
 
 # ============================================================================
@@ -314,6 +315,7 @@ class TomatoDataset(Dataset):
         heatmap_dir: str,
         confidence_path: str,
         depth_dir: str = None,
+        depth_npz_path: str = None,  # New: path to unified NPZ file (e.g., da3_results.npz)
         confidence_threshold: float = 0.5,
         split: str = "train"
     ):
@@ -325,7 +327,8 @@ class TomatoDataset(Dataset):
             images_dir: Path to RGB images directory
             heatmap_dir: Path to heatmap .npy files directory
             confidence_path: Path to confidence JSON file
-            depth_dir: Path to depth map .npz files directory (optional)
+            depth_dir: Path to individual depth map .npz/.png files directory (optional)
+            depth_npz_path: Path to unified DA3 results NPZ file (optional, takes precedence)
             confidence_threshold: YOLO confidence threshold for semantic validity (default: 0.5)
             split: Dataset split ("train" or "val"), currently unused
         """
@@ -333,6 +336,7 @@ class TomatoDataset(Dataset):
         self.images_dir = images_dir
         self.heatmap_dir = heatmap_dir
         self.depth_dir = depth_dir
+        self.depth_npz_path = depth_npz_path
         self.confidence_threshold = confidence_threshold
         self.split = split
 
@@ -354,6 +358,19 @@ class TomatoDataset(Dataset):
             self.confidence_dict = json.load(f)
         print(f"Loaded confidence data for {len(self.confidence_dict)} frames")
 
+        # Load unified NPZ file if provided (Depth Anything V3 format)
+        self.unified_depth_data = None
+        self.unified_depth_key_list = None
+        if depth_npz_path is not None:
+            if os.path.exists(depth_npz_path):
+                print(f"Loading unified depth NPZ from: {depth_npz_path}")
+                self.unified_depth_data = np.load(depth_npz_path)
+                print(f"  NPZ keys: {list(self.unified_depth_data.files)}")
+                print(f"  depth shape: {self.unified_depth_data['depth'].shape}")
+                print(f"  image shape: {self.unified_depth_data['image'].shape}")
+            else:
+                warnings.warn(f"Unified depth NPZ not found: {depth_npz_path}, will use individual depth files")
+
         # Validate depth directory if provided
         if depth_dir is not None:
             if not os.path.exists(depth_dir):
@@ -367,10 +384,18 @@ class TomatoDataset(Dataset):
         """
         Pre-load and cache all data in memory for faster training.
         Matches COLMAP images with heatmaps and confidence records.
+        Handles unified NPZ depth data with proper index mapping.
         """
         self.cached_data = []
 
-        for image_id, img_data in self.images_data.items():
+        # Build sorted list of image names for index-based NPZ access
+        # We assume NPZ order matches sorted filenames
+        image_list = sorted([
+            img_data['name']
+            for img_data in self.images_data.values()
+        ])
+
+        for idx, (image_id, img_data) in enumerate(self.images_data.items()):
             image_name = img_data['name']
             # Remove path prefix if present
             image_basename = os.path.basename(image_name)
@@ -387,14 +412,30 @@ class TomatoDataset(Dataset):
                 warnings.warn(f"Confidence data not found for: {name_without_ext}, skipping")
                 continue
 
-            # Check if depth map exists (if depth_dir is provided)
+            # Check if depth map exists (unified NPZ takes precedence)
             has_depth = False
-            if self.depth_dir is not None:
+            depth_source = None
+            depth_index = None
+
+            # Priority 1: Unified NPZ file
+            if self.unified_depth_data is not None:
+                # Find index in sorted list that matches current image
+                try:
+                    npz_index = image_list.index(image_name)
+                    has_depth = True
+                    depth_source = 'unified_npz'
+                    depth_index = npz_index
+                except ValueError:
+                    warnings.warn(f"Image {image_basename} not found in unified NPZ index list")
+
+            # Priority 2: Individual depth files
+            if not has_depth and self.depth_dir is not None:
                 # Support both .npz (DA3 format) and .png formats
                 for ext in ['.npz', '.png']:
                     depth_path = os.path.join(self.depth_dir, name_without_ext + ext)
                     if os.path.exists(depth_path):
                         has_depth = True
+                        depth_source = 'individual'
                         break
                 if not has_depth:
                     warnings.warn(f"Depth map not found for: {image_basename}, will skip depth for this frame")
@@ -416,7 +457,9 @@ class TomatoDataset(Dataset):
                 'R': img_data['R'],
                 'tvec': img_data['tvec'],
                 'camera_id': camera_id,
-                'has_depth': has_depth
+                'has_depth': has_depth,
+                'depth_source': depth_source,
+                'depth_index': depth_index
             })
 
         print(f"Successfully cached {len(self.cached_data)} valid frames")
@@ -462,29 +505,72 @@ class TomatoDataset(Dataset):
 
         # Load depth map if available
         depth_tensor = None
-        if data['has_depth'] and self.depth_dir is not None:
-            # Try .npz format (DA3) first, then fallback to .png
-            depth_path_npz = os.path.join(self.depth_dir, name_without_ext + ".npz")
-            depth_path_png = os.path.join(self.depth_dir, name_without_ext + ".png")
+        if data['has_depth']:
+            depth_source = data.get('depth_source', 'individual')
 
             try:
-                if os.path.exists(depth_path_npz):
-                    # Load DA3 .npz format (contains 'depth' key)
-                    depth_data = np.load(depth_path_npz)
-                    if 'depth' in depth_data:
-                        depth_np = depth_data['depth'].astype(np.float32)
-                    else:
-                        # Fallback: assume first array is depth
-                        depth_np = depth_data[list(depth_data.keys())[0]].astype(np.float32)
+                if depth_source == 'unified_npz' and self.unified_depth_data is not None:
+                    # Load from unified NPZ file with spatial alignment
+                    # This is the CRUCIAL part: DA3 depth is (280, 504), need to resize to (H, W)
+                    depth_index = data['depth_index']
+                    depth_small = self.unified_depth_data['depth'][depth_index]  # [280, 504]
+
+                    # SPATIAL ALIGNMENT: Resize depth to match RGB resolution
+                    # Use INTER_LINEAR for smooth upsampling (bilinear interpolation)
+                    depth_aligned = cv2.resize(
+                        depth_small,
+                        (W, H),  # (width, height) - OpenCV uses (W, H) convention
+                        interpolation=cv2.INTER_LINEAR
+                    )  # [H, W]
+
                     # Normalize to [0, 1] if not already
-                    if depth_np.max() > 1.0:
-                        depth_np = depth_np / depth_np.max()
-                    depth_tensor = torch.from_numpy(depth_np)  # [H, W]
-                elif os.path.exists(depth_path_png):
-                    # Load 16-bit PNG and normalize to [0, 1]
-                    depth_16bit = np.array(Image.open(depth_path_png), dtype=np.float32)
-                    depth_np = depth_16bit / 65535.0  # Convert from [0, 65535] to [0, 1]
-                    depth_tensor = torch.from_numpy(depth_np)  # [H, W]
+                    if depth_aligned.max() > 1.0:
+                        depth_aligned = depth_aligned / depth_aligned.max()
+
+                    depth_tensor = torch.from_numpy(depth_aligned.astype(np.float32))  # [H, W]
+
+                elif depth_source == 'individual' and self.depth_dir is not None:
+                    # Try .npz format (DA3) first, then fallback to .png
+                    depth_path_npz = os.path.join(self.depth_dir, name_without_ext + ".npz")
+                    depth_path_png = os.path.join(self.depth_dir, name_without_ext + ".png")
+
+                    if os.path.exists(depth_path_npz):
+                        # Load individual DA3 .npz format (contains 'depth' key)
+                        depth_data = np.load(depth_path_npz)
+                        if 'depth' in depth_data:
+                            depth_np = depth_data['depth'].astype(np.float32)
+                        else:
+                            # Fallback: assume first array is depth
+                            depth_np = depth_data[list(depth_data.keys())[0]].astype(np.float32)
+
+                        # Check if resize is needed
+                        if depth_np.shape[:2] != (H, W):
+                            depth_np = cv2.resize(
+                                depth_np,
+                                (W, H),
+                                interpolation=cv2.INTER_LINEAR
+                            ).astype(np.float32)
+
+                        # Normalize to [0, 1] if not already
+                        if depth_np.max() > 1.0:
+                            depth_np = depth_np / depth_np.max()
+                        depth_tensor = torch.from_numpy(depth_np)  # [H, W]
+
+                    elif os.path.exists(depth_path_png):
+                        # Load 16-bit PNG and normalize to [0, 1]
+                        depth_16bit = np.array(Image.open(depth_path_png), dtype=np.float32)
+                        depth_np = depth_16bit / 65535.0  # Convert from [0, 65535] to [0, 1]
+
+                        # Check if resize is needed
+                        if depth_np.shape[:2] != (H, W):
+                            depth_np = cv2.resize(
+                                depth_np,
+                                (W, H),
+                                interpolation=cv2.INTER_LINEAR
+                            ).astype(np.float32)
+
+                        depth_tensor = torch.from_numpy(depth_np)  # [H, W]
+
             except Exception as e:
                 warnings.warn(f"Failed to load depth map for {name_without_ext}: {e}")
                 depth_tensor = None
@@ -547,6 +633,7 @@ def create_dataloader(
     heatmap_dir: str,
     confidence_path: str,
     depth_dir: str = None,
+    depth_npz_path: str = None,  # New: path to unified NPZ file
     confidence_threshold: float = 0.5,
     batch_size: int = 1,
     num_workers: int = 4,
@@ -560,7 +647,8 @@ def create_dataloader(
         images_dir: Path to RGB images directory
         heatmap_dir: Path to heatmap .npy files directory
         confidence_path: Path to confidence JSON file
-        depth_dir: Path to depth map .npz files directory (optional)
+        depth_dir: Path to individual depth map .npz/.png files directory (optional)
+        depth_npz_path: Path to unified DA3 results NPZ file (optional, takes precedence)
         confidence_threshold: YOLO confidence threshold for semantic validity (default: 0.5)
         batch_size: Batch size
         num_workers: Number of worker processes
@@ -575,6 +663,7 @@ def create_dataloader(
         heatmap_dir=heatmap_dir,
         confidence_path=confidence_path,
         depth_dir=depth_dir,
+        depth_npz_path=depth_npz_path,
         confidence_threshold=confidence_threshold
     )
 
