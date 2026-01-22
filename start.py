@@ -7,6 +7,7 @@ import argparse
 import sys
 import os
 from pathlib import Path
+import traceback
 
 # Add project root to path
 _project_root = Path(__file__).parent.absolute()
