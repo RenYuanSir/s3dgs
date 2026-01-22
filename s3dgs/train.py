@@ -504,40 +504,14 @@ def train(
 
 
 # ============================================================================
-# Main Entry Point
+# Module Export
 # ============================================================================
-
-if __name__ == "__main__":
-    # Configuration
-    train(
-        # Data paths (modify these for your setup)
-        colmap_dir=r"D:\PythonProject\PythonProject\data\video_data\colmap_data\video2_output_ply",
-        images_dir=r"D:\PythonProject\PythonProject\data\video_data\frames\video2_frame",
-        heatmap_dir=r"D:\PythonProject\PythonProject\data\heatmaps\heatmap_video2_stem",
-        confidence_path=r"D:\PythonProject\PythonProject\data\heatmaps\confidence_video2_stem.json",
-        pcd_path=r"D:\PythonProject\PythonProject\data\video_data\colmap_data\video2_output_ply\sparse\0\points3D.ply",
-        depth_dir=r"D:\PythonProject\PythonProject\data\depths\video2_depths",  # New: depth maps directory
-
-        # Training settings
-        num_iterations=20000,
-        warmup_iterations=4000,    # "Geometry First": RGB builds cylindrical volume before semantic classification
-        lambda_sem=0.2,            # Standard weight (skeleton supervision is already strong)
-        lambda_depth=0.1,          # New: depth loss weight (scale-invariant)
-        lr_scale=1.0,
-        spatial_lr_scale=1.0,
-
-        # Model settings
-        sh_degree=3,
-        num_classes=4,
-
-        # Loss weights
-        fg_weight=20.0,
-
-        # Logging
-        log_every=100,
-        save_every=5000,
-        output_dir=r"D:\PythonProject\PythonProject\output\video2_depth_supervision",  # Updated output directory
-
-        # Device
-        device="cuda" if torch.cuda.is_available() else "cpu"
-    )
+# To train from command line, use: python start.py
+# This module can also be imported and used programmatically:
+#
+# from s3dgs.train import train
+# train(
+#     colmap_dir="./data/colmap",
+#     images_dir="./data/images",
+#     ...
+# )
