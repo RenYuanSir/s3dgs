@@ -189,13 +189,27 @@ def train(
     # Initialize DefaultStrategy
     # ========================================================================
     print("\nInitializing DefaultStrategy...")
+    print("Strategy: Pruning-focused (Dense Initialization from DA3)")
+    print("  - Starting with ~500k dense points from DA3")
+    print("  - Aggressive pruning to remove depth-error floaters")
+    print("  - Conservative splitting (only on strong error signals)")
+    print("  - Delayed refinement to let geometry align first")
+
     strategy = DefaultStrategy(
         refine_every=100,
-        grow_grad2d=0.00005,       # 5e-5: Recalibrated for skeleton supervision (stronger signal over lines)
-        grow_scale3d=0.005,        # Split features > 0.025 units (5.0 * 0.005 = 0.025), enforce high density for stem volume
-        prune_opa=0.005,
+        grow_grad2d=0.0002,        # 2e-4: Official default (conservative splitting)
+                                   # Rationale: Starting dense (~500k points), only split if
+                                   # there is a VERY strong 2D gradient error signal.
+                                   # Previous aggressive growth (5e-5) caused OOM and noise.
+        grow_scale3d=0.005,        # Split features > 0.025 units (5.0 * 0.005 = 0.025)
+                                   # Keep conservative to avoid over-splitting dense regions
+        prune_opa=0.005,           # Aggressively prune invisible/transparent Gaussians
+                                   # Rationale: DA3 depth errors generate "floaters" in empty space.
+                                   # Strong opacity pruning removes these artifacts early.
         prune_scale3d=3.0,         # Tolerance radius ~15.0 units (5.0 * 3.0 = 15.0)
-        refine_start_iter=500,
+        refine_start_iter=1000,    # Delay refinement to iteration 1000
+                                   # Rationale: Start dense, let geometry align through
+                                   # optimization before splitting. Prevents premature explosion.
         refine_stop_iter=15000,
         reset_every=3000,
         absgrad=True,              # AbsGS: use absolute gradients for robust densification
