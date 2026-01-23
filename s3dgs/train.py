@@ -80,7 +80,7 @@ def train(
     confidence_threshold: float = 0.5,  # YOLO confidence threshold for semantic validity
 
     # Performance optimization
-    resolution_scale: float = 0.5,  # Safer resolution (1/4 pixels) for initial dense optimization
+    resolution_scale: float = 1.0,  # Full resolution (1080P) - optimized rendering pipeline now handles this efficiently
 
     # Logging
     log_every: int = 100,
@@ -329,6 +329,15 @@ def train(
         for optimizer in optimizers.values():
             optimizer.zero_grad()
 
+        # ====================================================================
+        # Memory Monitoring (Before Render)
+        # ====================================================================
+        if device == "cuda" and iteration == 0:
+            torch.cuda.empty_cache()
+            mem_before = torch.cuda.memory_allocated() / 1e9
+            mem_reserved = torch.cuda.memory_reserved() / 1e9
+            print(f"\n[MEM] Iter {iteration}: Before render - Allocated={mem_before:.2f}GiB, Reserved={mem_reserved:.2f}GiB")
+
         # Render with controlled auxiliary passes based on warm-up stage
         renders = render_dual_pass(
             model=model,
@@ -339,6 +348,15 @@ def train(
             sh_degree=sh_degree,
             render_depth=render_depth  # Controlled by warm-up stage
         )
+
+        # ====================================================================
+        # Memory Monitoring (After Render)
+        # ====================================================================
+        if device == "cuda" and iteration == 0:
+            mem_after_render = torch.cuda.memory_allocated() / 1e9
+            mem_reserved_after = torch.cuda.memory_reserved() / 1e9
+            print(f"[MEM] Iter {iteration}: After render - Allocated={mem_after_render:.2f}GiB, Reserved={mem_reserved_after:.2f}GiB")
+            print(f"[MEM] Render memory delta: {mem_after_render - mem_before:.2f}GiB")
 
         pred_rgb = renders['rgb']  # [H, W, 3]
         pred_sem = renders['semantic']  # [H, W, K]
@@ -435,6 +453,15 @@ def train(
             max_grad_norm = 0.0
             if model.params['means'].grad is not None:
                 max_grad_norm = model.params['means'].grad.norm(dim=-1).max().item()
+
+            # ====================================================================
+            # Memory Monitoring (Periodic)
+            # ====================================================================
+            if device == "cuda":
+                mem_allocated = torch.cuda.memory_allocated() / 1e9
+                mem_reserved = torch.cuda.memory_reserved() / 1e9
+                num_gaussians = model.params['means'].shape[0]
+                print(f"[MEM] Iter {iteration}: Gaussians={num_gaussians:,}, GPU={mem_allocated:.2f}GiB alloc / {mem_reserved:.2f}GiB reserv")
 
         # ====================================================================
         # Post-Backward Step (Densification)

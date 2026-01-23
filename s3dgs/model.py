@@ -89,36 +89,90 @@ class SemanticGaussianModel(nn.Module):
         # Position: directly from point cloud
         self.params['means'] = nn.Parameter(torch.tensor(xyz, dtype=torch.float32))
 
-        # Scale: based on KNN distances with adaptive scale floor and ceiling
+        # Scale: based on KNN distances with DENSITY-AWARE adaptive scaling
         kdtree = KDTree(xyz)
         distances, _ = kdtree.query(xyz, k=4)  # k=4 because first point is itself
         mean_distances = np.mean(distances[:, 1:], axis=1)  # Skip first (self)
 
-        # CRITICAL: Adaptive scale floor to prevent Gaussian explosion
-        # For dense point clouds (500k+ points), KNN distance can be ~1e-5,
-        # leading to scales that cause massive screen-space overdraw (OOM).
-        # Solution: Compute scene radius and set floor proportionally.
+        # ========================================================================
+        # DENSITY-AWARE ADAPTIVE SCALING (NEW)
+        # ========================================================================
+        # Problem: Reducing point cloud from 500K to 80K increases KNN distance by ~6.25x,
+        # causing Gaussians to cover larger screen areas → massive overdraw → OOM.
+        #
+        # Solution: Adaptively scale Gaussian sizes based on point cloud DENSITY,
+        # not just absolute KNN distances. This ensures consistent screen-space coverage
+        # regardless of point cloud sampling density.
+        #
+        # Reference baseline: 500K points in typical scene (radius ~5-10 units)
+        # Target: Maintain equivalent screen-space footprint for any point count.
+
+        # Compute scene properties
+        min_xyz = xyz.min(axis=0)
+        max_xyz = xyz.max(axis=0)
+        scene_radius = np.linalg.norm(max_xyz - min_xyz)
+        scene_volume = (4/3) * np.pi * (scene_radius ** 3)
+
+        # Point cloud density (points per unit volume)
+        point_density = num_points / scene_volume
+
+        # Reference density: 500K points in typical scene
+        # For a scene with radius=5, volume ≈ 523.6 units³
+        # Reference density ≈ 500000 / 523.6 ≈ 955 points/unit³
+        reference_density = 500000 / ((4/3) * np.pi * (5.0 ** 3))
+
+        # Density ratio: how much sparser/denser is our cloud vs reference?
+        density_ratio = point_density / reference_density
+
+        # Adaptive scale adjustment based on density
+        # If density is lower (sparse cloud), we need SMALLER scales to maintain coverage
+        # If density is higher (dense cloud), we can afford slightly larger scales
+        # Formula: target_scale = knn_distance * (density_ratio ^ 0.5)
+        # The square root ensures we don't over-adjust for extreme density changes
+        density_factor = np.sqrt(density_ratio)
+
+        print(f"\n{'='*60}")
+        print("Density-Aware Gaussian Scaling")
+        print(f"{'='*60}")
+        print(f"  Points: {num_points:,}")
+        print(f"  Scene radius: {scene_radius:.4f} units")
+        print(f"  Point density: {point_density:.4f} points/unit³")
+        print(f"  Reference density (500K@r=5): {reference_density:.4f} points/unit³")
+        print(f"  Density ratio: {density_ratio:.4f}x")
+        print(f"  Density adjustment factor: {density_factor:.4f}x")
+
+        # Apply density-aware scaling
+        # CRITICAL: For sparse clouds (density_ratio < 1), we REDUCE scales more aggressively
+        # This prevents the "80K points but same memory as 500K" problem
+        mean_distances = mean_distances * 0.1 * density_factor
+
+        # Adaptive scale ceiling based on density
+        # Sparse clouds get STRICTER limits to prevent screen-space explosion
+        # Dense clouds get more relaxed limits
+        if density_ratio < 0.5:
+            # Very sparse (<250K): strict limit
+            max_scale = 0.003
+            print(f"  Sparse cloud detected: max_scale={max_scale}")
+        elif density_ratio < 1.0:
+            # Moderately sparse (250K-500K): moderate limit
+            max_scale = 0.005
+            print(f"  Moderately sparse: max_scale={max_scale}")
+        else:
+            # Dense (>=500K): relaxed limit
+            max_scale = 0.01
+            print(f"  Dense cloud: max_scale={max_scale}")
+
+        # Apply adaptive ceiling
+        mean_distances = np.clip(mean_distances, 1e-5, max_scale)
+
+        # Adaptive scale floor based on scene radius (prevents Gaussians becoming too small)
+        # More conservative for larger scenes
         if min_scale_threshold is None:
-            # Compute scene radius
-            min_xyz = xyz.min(axis=0)
-            max_xyz = xyz.max(axis=0)
-            scene_radius = np.linalg.norm(max_xyz - min_xyz)
-            # Set floor to 1e-4 of scene radius (very conservative)
-            # For typical scenes with radius ~5-10 units, this gives ~5e-4 to 1e-3
-            min_scale_threshold = max(scene_radius * 1e-4, 1e-5)  # Safety floor at 1e-5
-
-        # CRITICAL FIX #1: Hard reduction to prevent giant Gaussians
-        # For sparse point clouds (e.g., 80k points), KNN distances can be very large,
-        # causing Gaussians to cover ~75% of screen → massive overdraw → OOM.
-        mean_distances = mean_distances * 0.1
-
-        # CRITICAL FIX #2: Safety clamp to enforce maximum scale
-        # Ensures no Gaussian can be initialized as a "giant sphere" covering the screen.
-        # Maximum of 0.01 world units prevents screen-space explosion.
-        mean_distances = np.clip(mean_distances, 1e-5, 0.01)
-
-        # Apply adaptive scale floor (only for numerical stability)
+            min_scale_threshold = max(scene_radius * 1e-4, 1e-5)
         mean_distances = np.maximum(mean_distances, min_scale_threshold)
+
+        print(f"  Final scale range: [{mean_distances.min():.6f}, {mean_distances.max():.6f}]")
+        print(f"{'='*60}\n")
 
         # Convert to log-space (inverse of exp activation)
         scales = np.tile(np.log(mean_distances)[:, np.newaxis], (1, 3))
