@@ -234,7 +234,9 @@ def train(
     # ========================================================================
     print("\nStarting training...")
     print(f"Total iterations: {num_iterations}")
-    print(f"Warm-up iterations: {warmup_iterations} (lambda_sem=0)")
+    print(f"Geometry Warm-up Stage 1 (iter < 1000): RGB-only rendering")
+    print(f"Geometry Warm-up Stage 2 (1000 <= iter < {warmup_iterations}): RGB + Depth, semantic loss disabled")
+    print(f"Full Training (iter >= {warmup_iterations}): RGB + Semantic + Depth")
     print(f"Lambda_sem after warm-up: {lambda_sem}")
     if has_depth:
         print(f"Lambda_depth: {lambda_depth}")
@@ -312,13 +314,22 @@ def train(
         H, W = image.shape[:2]
 
         # ====================================================================
-        # Forward Pass: Dual-Pass Rendering
+        # Geometry Warm-up: Staged Rendering Strategy
         # ====================================================================
+        # Stage 1 (iter < 1000): RGB-only to minimize memory spike
+        # Stage 2 (1000 <= iter < warmup_iterations): RGB + Depth, semantic disabled
+        # Stage 3 (iter >= warmup_iterations): Full RGB + Semantic + Depth
+
+        # Determine rendering flags based on iteration
+        geometry_warmup_iter = 1000  # Stage 1: RGB-only for first 1000 iters
+        render_semantic = (iteration >= geometry_warmup_iter)
+        render_depth = (gt_depth is not None) and (iteration >= geometry_warmup_iter)
+
         # Zero gradients for all optimizers
         for optimizer in optimizers.values():
             optimizer.zero_grad()
 
-        # Render RGB, Semantic, and Depth (if available)
+        # Render with controlled auxiliary passes based on warm-up stage
         renders = render_dual_pass(
             model=model,
             viewmat=viewmat,
@@ -326,7 +337,7 @@ def train(
             width=W,
             height=H,
             sh_degree=sh_degree,
-            render_depth=(gt_depth is not None)  # Enable depth rendering if GT depth available
+            render_depth=render_depth  # Controlled by warm-up stage
         )
 
         pred_rgb = renders['rgb']  # [H, W, 3]
@@ -338,12 +349,12 @@ def train(
         # ====================================================================
         # Compute Losses
         # ====================================================================
-        # RGB loss (L1)
+        # RGB loss (L1) - ALWAYS active
         loss_rgb = l1_loss(pred_rgb, image)
 
-        # Depth loss (scale-invariant, if available)
+        # Depth loss (scale-invariant, controlled by warm-up stage)
         loss_depth = torch.tensor(0.0, device=device)
-        if pred_depth is not None and gt_depth is not None:
+        if iteration >= geometry_warmup_iter and pred_depth is not None and gt_depth is not None:
             # Ensure GT depth matches rendered resolution
             if gt_depth.shape != pred_depth.shape:
                 gt_depth_resized = torch.nn.functional.interpolate(
@@ -357,7 +368,10 @@ def train(
 
             loss_depth = scale_invariant_depth_loss(pred_depth, gt_depth_resized)
 
-        # Semantic loss (if past warm-up)
+        # Semantic loss (controlled by warm-up stage)
+        # Stage 1 (iter < 1000): Disabled (no semantic rendering)
+        # Stage 2 (1000 <= iter < warmup_iterations): Disabled (semantic rendered but loss=0)
+        # Stage 3 (iter >= warmup_iterations): Enabled with lambda_sem
         if iteration < warmup_iterations:
             loss_sem = torch.tensor(0.0, device=device)
             current_lambda_sem = 0.0
@@ -463,11 +477,19 @@ def train(
             if model.params['means'].grad is not None:
                 max_grad_norm = model.params['means'].grad.norm(dim=-1).max().item()
 
+            # Determine training stage for logging
+            if iteration < geometry_warmup_iter:
+                stage = "STAGE1:RGB"
+            elif iteration < warmup_iterations:
+                stage = "STAGE2:RGB+D"
+            else:
+                stage = "STAGE3:FULL"
+
             # Log semantic mask status for debugging
             sem_mask_val = sem_mask.item()
             sem_status = "ENABLED" if sem_mask_val > 0.5 else "DISABLED"
 
-            print(f"Iter {iteration:5d} | "
+            print(f"Iter {iteration:5d} [{stage}] | "
                   f"Loss: {total_loss.item():.6f} (RGB: {loss_rgb.item():.6f}, "
                   f"Depth: {loss_depth.item():.6f}, "
                   f"Sem: {loss_sem.item():.6f} [{sem_status}], lambda_sem: {current_lambda_sem:.3f}) | "
