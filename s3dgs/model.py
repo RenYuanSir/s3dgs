@@ -64,23 +64,21 @@ class SemanticGaussianModel(nn.Module):
         self,
         pcd_path: str,
         spatial_lr_scale: float = 1.0,
-        min_scale_threshold: float = 0.005
+        min_scale_threshold: float = None
     ):
         """
         Initialize Gaussian parameters from a point cloud file.
 
         Supports robust initialization from dense point clouds (DA3) with:
-        - Scale floor to prevent scale collapse in dense clouds
+        - Adaptive scale threshold based on scene scale
         - Optional semantic prior loading from precomputed .pt files
 
         Args:
             pcd_path: Path to PLY or TXT file containing points with RGB
             spatial_lr_scale: Spatial learning rate scale factor
-            min_scale_threshold: Minimum scale threshold to prevent collapse.
-                                 For dense clouds (~500k points), KNN distances
-                                 can be ~1e-5, causing scale collapse. This ensures
-                                 every Gaussian covers at least ~1 pixel initially.
-                                 Default: 0.005 (assuming world scale ~1.0)
+            min_scale_threshold: Minimum scale threshold (DEPRECATED, now auto-computed).
+                                 If None, automatically computed as scene_radius * 1e-4.
+                                 This prevents Gaussian explosion in dense clouds.
         """
         # Load point cloud
         xyz, rgb = self._load_point_cloud(pcd_path)
@@ -91,14 +89,25 @@ class SemanticGaussianModel(nn.Module):
         # Position: directly from point cloud
         self.params['means'] = nn.Parameter(torch.tensor(xyz, dtype=torch.float32))
 
-        # Scale: based on KNN distances with robust scale floor
+        # Scale: based on KNN distances with adaptive scale floor
         kdtree = KDTree(xyz)
         distances, _ = kdtree.query(xyz, k=4)  # k=4 because first point is itself
         mean_distances = np.mean(distances[:, 1:], axis=1)  # Skip first (self)
 
-        # CRITICAL: Apply scale floor to prevent collapse in dense clouds
+        # CRITICAL: Adaptive scale floor to prevent Gaussian explosion
         # For dense point clouds (500k+ points), KNN distance can be ~1e-5,
-        # leading to scales too small for gradient propagation.
+        # leading to scales that cause massive screen-space overdraw (OOM).
+        # Solution: Compute scene radius and set floor proportionally.
+        if min_scale_threshold is None:
+            # Compute scene radius
+            min_xyz = xyz.min(axis=0)
+            max_xyz = xyz.max(axis=0)
+            scene_radius = np.linalg.norm(max_xyz - min_xyz)
+            # Set floor to 1e-4 of scene radius (very conservative)
+            # For typical scenes with radius ~5-10 units, this gives ~5e-4 to 1e-3
+            min_scale_threshold = max(scene_radius * 1e-4, 1e-5)  # Safety floor at 1e-5
+
+        # Apply adaptive scale floor (only for numerical stability)
         mean_distances = np.maximum(mean_distances, min_scale_threshold)
 
         # Convert to log-space (inverse of exp activation)
@@ -140,7 +149,7 @@ class SemanticGaussianModel(nn.Module):
         self.params['semantic'] = nn.Parameter(semantic_init.to(torch.float32))
 
         print(f"Initialized {num_points} Gaussians with {self._num_classes} semantic classes")
-        print(f"  Scale threshold applied: {min_scale_threshold:.6f}")
+        print(f"  Adaptive scale threshold: {min_scale_threshold:.6f}")
         print(f"  Semantic prior loaded: {semantic_init.shape}")
 
     def _load_semantic_priors(self, pcd_path: str, num_points: int) -> torch.Tensor:

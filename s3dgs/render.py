@@ -193,7 +193,7 @@ def _render_depth_map(
         height=height,
         sh_degree=None,  # No SH for depth
         packed=True,
-        absgrad=True
+        absgrad=False  # No need for densification gradients in auxiliary depth pass
     )
 
     # depth_render: [1, H, W, 3] -> [H, W] (take R channel)
@@ -271,7 +271,7 @@ def _render_semantic_map(
             height=height,
             sh_degree=None,
             packed=True,
-            absgrad=True  # AbsGS: use absolute gradients for densification
+            absgrad=False  # No need for densification gradients in auxiliary semantic pass
         )
 
         sem_render2, _, _ = rasterization(
@@ -286,7 +286,7 @@ def _render_semantic_map(
             height=height,
             sh_degree=None,
             packed=True,
-            absgrad=True  # AbsGS: use absolute gradients for densification
+            absgrad=False  # No need for densification gradients in auxiliary semantic pass
         )
 
         # sem_render1: [1, H, W, 3] -> [H, W, 3] (packed mode output shape)

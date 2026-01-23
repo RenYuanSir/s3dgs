@@ -80,7 +80,7 @@ def train(
     confidence_threshold: float = 0.5,  # YOLO confidence threshold for semantic validity
 
     # Performance optimization
-    resolution_scale: float = 0.75,  # Full resolution for skeleton supervision (no downscaling)
+    resolution_scale: float = 0.5,  # Safer resolution (1/4 pixels) for initial dense optimization
 
     # Logging
     log_every: int = 100,
@@ -272,8 +272,8 @@ def train(
         # ====================================================================
         # Apply Resolution Scaling (Performance Optimization)
         # ====================================================================
-        # resolution_scale=0.75 provides good balance between quality and speed
-        # Reduces pixels by ~44% (0.75^2 = 0.5625), resulting in ~2x speedup
+        # resolution_scale=0.5 provides safer training for dense clouds
+        # Reduces pixels by ~75% (0.5^2 = 0.25), preventing OOM in isect_tiles
         if resolution_scale != 1.0:
             import torch.nn.functional as F
 
