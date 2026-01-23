@@ -89,7 +89,7 @@ class SemanticGaussianModel(nn.Module):
         # Position: directly from point cloud
         self.params['means'] = nn.Parameter(torch.tensor(xyz, dtype=torch.float32))
 
-        # Scale: based on KNN distances with adaptive scale floor
+        # Scale: based on KNN distances with adaptive scale floor and ceiling
         kdtree = KDTree(xyz)
         distances, _ = kdtree.query(xyz, k=4)  # k=4 because first point is itself
         mean_distances = np.mean(distances[:, 1:], axis=1)  # Skip first (self)
@@ -106,6 +106,16 @@ class SemanticGaussianModel(nn.Module):
             # Set floor to 1e-4 of scene radius (very conservative)
             # For typical scenes with radius ~5-10 units, this gives ~5e-4 to 1e-3
             min_scale_threshold = max(scene_radius * 1e-4, 1e-5)  # Safety floor at 1e-5
+
+        # CRITICAL FIX #1: Hard reduction to prevent giant Gaussians
+        # For sparse point clouds (e.g., 80k points), KNN distances can be very large,
+        # causing Gaussians to cover ~75% of screen → massive overdraw → OOM.
+        mean_distances = mean_distances * 0.1
+
+        # CRITICAL FIX #2: Safety clamp to enforce maximum scale
+        # Ensures no Gaussian can be initialized as a "giant sphere" covering the screen.
+        # Maximum of 0.01 world units prevents screen-space explosion.
+        mean_distances = np.clip(mean_distances, 1e-5, 0.01)
 
         # Apply adaptive scale floor (only for numerical stability)
         mean_distances = np.maximum(mean_distances, min_scale_threshold)
@@ -149,7 +159,7 @@ class SemanticGaussianModel(nn.Module):
         self.params['semantic'] = nn.Parameter(semantic_init.to(torch.float32))
 
         print(f"Initialized {num_points} Gaussians with {self._num_classes} semantic classes")
-        print(f"  Adaptive scale threshold: {min_scale_threshold:.6f}")
+        print(f"  Adaptive scale threshold: {min_scale_threshold:.6f} (max: 0.01)")
         print(f"  Semantic prior loaded: {semantic_init.shape}")
 
     def _load_semantic_priors(self, pcd_path: str, num_points: int) -> torch.Tensor:
